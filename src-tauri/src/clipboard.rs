@@ -397,13 +397,40 @@ fn is_wl_copy_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Runs `command` with `text` written to its stdin and waits for it to exit.
+///
+/// The typing tools and wl-copy get the text this way rather than as an
+/// argument, because other local users can read arguments through
+/// /proc/<pid>/cmdline. wl-copy also keeps running for as long as it owns the
+/// clipboard, and on the paste path that is the user's restored clipboard.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn run_with_stdin(command: &mut Command, text: &str) -> std::io::Result<std::process::Output> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = command.stdin(Stdio::piped()).spawn()?;
+    // stdin is dropped when the match ends, which closes the pipe so the tool
+    // sees EOF.
+    let write_result = match child.stdin.take() {
+        Some(mut stdin) => stdin.write_all(text.as_bytes()),
+        None => Ok(()),
+    };
+    // Wait even if the write failed so the child is always reaped.
+    let output = child.wait_with_output()?;
+    // A tool that exits without reading everything breaks the pipe. If it
+    // failed, its exit status and stderr explain more than the write error.
+    if output.status.success() {
+        write_result?;
+    }
+    Ok(output)
+}
+
 /// Type text directly via wtype on Wayland.
 #[cfg(target_os = "linux")]
 fn type_text_via_wtype(text: &str) -> Result<(), String> {
-    let output = Command::new("wtype")
-        .arg("--") // Protect against text starting with -
-        .arg(text)
-        .output()
+    use std::process::Stdio;
+    // `-` makes wtype read the text from stdin.
+    let output = run_with_stdin(Command::new("wtype").arg("-").stderr(Stdio::piped()), text)
         .map_err(|e| format!("Failed to execute wtype: {}", e))?;
 
     if !output.status.success() {
@@ -417,13 +444,14 @@ fn type_text_via_wtype(text: &str) -> Result<(), String> {
 /// Type text directly via xdotool on X11.
 #[cfg(target_os = "linux")]
 fn type_text_via_xdotool(text: &str) -> Result<(), String> {
-    let output = Command::new("xdotool")
-        .arg("type")
-        .arg("--clearmodifiers")
-        .arg("--")
-        .arg(text)
-        .output()
-        .map_err(|e| format!("Failed to execute xdotool: {}", e))?;
+    use std::process::Stdio;
+    let output = run_with_stdin(
+        Command::new("xdotool")
+            .args(["type", "--clearmodifiers", "--file", "-"])
+            .stderr(Stdio::piped()),
+        text,
+    )
+    .map_err(|e| format!("Failed to execute xdotool: {}", e))?;
 
     // `--clearmodifiers` restores the modifiers that were held when xdotool
     // started. If the user releases one while xdotool is typing, that synthetic
@@ -506,12 +534,16 @@ fn type_text_via_dotool(text: &str) -> Result<(), String> {
 /// Type text directly via ydotool (uinput-based, requires ydotoold daemon).
 #[cfg(target_os = "linux")]
 fn type_text_via_ydotool(text: &str) -> Result<(), String> {
-    let output = Command::new("ydotool")
-        .arg("type")
-        .arg("--")
-        .arg(text)
-        .output()
-        .map_err(|e| format!("Failed to execute ydotool: {}", e))?;
+    use std::process::Stdio;
+    // ydotool 1.0.0 and 1.0.1 open `--file -` as a path, so name stdin
+    // explicitly. This works with 0.1.8 and every 1.x release.
+    let output = run_with_stdin(
+        Command::new("ydotool")
+            .args(["type", "--file", "/dev/stdin"])
+            .stderr(Stdio::piped()),
+        text,
+    )
+    .map_err(|e| format!("Failed to execute ydotool: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -522,6 +554,8 @@ fn type_text_via_ydotool(text: &str) -> Result<(), String> {
 }
 
 /// Type text directly via kwtype (KDE Wayland virtual keyboard, uses KDE Fake Input protocol).
+/// kwtype only accepts the text as an argument, so unlike the other tools it
+/// is visible in the process list while kwtype runs.
 #[cfg(target_os = "linux")]
 fn type_text_via_kwtype(text: &str) -> Result<(), String> {
     let output = Command::new("kwtype")
@@ -544,15 +578,18 @@ fn type_text_via_kwtype(text: &str) -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn write_clipboard_via_wl_copy(text: &str) -> Result<(), String> {
     use std::process::Stdio;
-    let status = Command::new("wl-copy")
-        .arg("--")
-        .arg(text)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("Failed to execute wl-copy: {}", e))?;
+    // When reading stdin, wl-copy guesses the MIME type from the content
+    // (JSON-looking text becomes application/json), so set it explicitly.
+    let output = run_with_stdin(
+        Command::new("wl-copy")
+            .args(["--type", "text/plain;charset=utf-8"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+        text,
+    )
+    .map_err(|e| format!("Failed to execute wl-copy: {}", e))?;
 
-    if !status.success() {
+    if !output.status.success() {
         return Err("wl-copy failed".into());
     }
 
@@ -973,6 +1010,50 @@ e.g. 28:1 28:0 means pressing on the Enter button on a standard US keyboard.
 
         assert_eq!(result.unwrap_err(), "input failed");
         assert!(restored.get());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_stdin_passes_text_on_stdin_not_in_arguments() {
+        use std::process::Stdio;
+        let text = "-n first line\nsecond line with \\n and ü";
+        let output = run_with_stdin(
+            Command::new("sh")
+                .args(["-c", r#"test "$#" -eq 0 && cat"#])
+                .stdout(Stdio::piped()),
+            text,
+        )
+        .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, text.as_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_stdin_reports_tool_failure_when_tool_exits_early() {
+        use std::process::Stdio;
+        // Larger than a pipe buffer, so the write fails once the tool exits.
+        let text = "a".repeat(1 << 20);
+        let output = run_with_stdin(
+            Command::new("sh")
+                .args(["-c", "echo failed >&2; exit 3"])
+                .stderr(Stdio::piped()),
+            &text,
+        )
+        .unwrap();
+
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stderr, b"failed\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_stdin_errors_when_tool_succeeds_without_reading_text() {
+        let text = "a".repeat(1 << 20);
+        let error = run_with_stdin(Command::new("sh").args(["-c", "exit 0"]), &text).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
     #[cfg(unix)]
