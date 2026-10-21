@@ -48,6 +48,9 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
   // arrived — e.g. while macOS Secure Input is active (issue #1578).
   const keyedShortcutRef = useRef<string>("");
   const modifierOnlyShortcutRef = useRef<string>("");
+  // True from clicking the shortcut until recording ends, including while the
+  // start command is still pending
+  const captureActiveRef = useRef(false);
   const osType = useOsType();
 
   const bindings = getSetting("bindings") || {};
@@ -55,6 +58,7 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
   // Handle cancellation
   const cancelRecording = useCallback(async () => {
     if (!isRecording) return;
+    captureActiveRef.current = false;
 
     // Stop listening for backend events
     if (unlistenRef.current) {
@@ -114,6 +118,7 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
         }
 
         // Stop recording
+        captureActiveRef.current = false;
         if (unlistenRef.current) {
           unlistenRef.current();
           unlistenRef.current = null;
@@ -190,6 +195,24 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
     t,
   ]);
 
+  // The backend ends recording by itself after a timeout or when the window
+  // loses focus. Nothing was saved, so just leave recording mode.
+  useEffect(() => {
+    const unlisten = listen("handy-keys-recording-stopped", () => {
+      if (!captureActiveRef.current) return;
+      captureActiveRef.current = false;
+      setIsRecording(false);
+      setCurrentKeys("");
+      currentKeysRef.current = "";
+      keyedShortcutRef.current = "";
+      modifierOnlyShortcutRef.current = "";
+      setOriginalBinding("");
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
   // Handle click outside
   useEffect(() => {
     if (!isRecording) return;
@@ -210,6 +233,7 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
   // Start recording a new shortcut
   const startRecording = async () => {
     if (isRecording) return;
+    captureActiveRef.current = true;
 
     // Store the original binding to restore if canceled
     setOriginalBinding(bindings[shortcutId]?.current_binding || "");
@@ -221,6 +245,7 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
     try {
       const result = await commands.startHandyKeysRecording(shortcutId);
       if (result.status === "error") {
+        captureActiveRef.current = false;
         if (String(result.error).includes("secure-input-active")) {
           toast.error(t("secureInput.recorderBlocked"), {
             action: {
@@ -237,12 +262,16 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
         }
         return;
       }
+      // Recording may already have ended, e.g. the window lost focus before
+      // the start command returned.
+      if (!captureActiveRef.current) return;
       setIsRecording(true);
       setCurrentKeys("");
       currentKeysRef.current = "";
       keyedShortcutRef.current = "";
       modifierOnlyShortcutRef.current = "";
     } catch (error) {
+      captureActiveRef.current = false;
       console.error("Failed to start recording:", error);
       toast.error(
         t("settings.general.shortcut.errors.set", { error: String(error) }),

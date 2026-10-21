@@ -24,23 +24,36 @@
 //! ## Recording Mode
 //!
 //! For UI key capture, a separate `KeyboardListener` is created on-demand and
-//! polled from a dedicated recording thread. Events are emitted to the frontend
-//! via Tauri's event system.
+//! polled from a dedicated recording thread. Events are emitted to the main
+//! window only. Recording ends on its own after `RECORDING_TIMEOUT` or once the
+//! main window loses focus, so the listener can't be left running.
 
 use handy_keys::{Hotkey, HotkeyId, HotkeyManager, HotkeyState, KeyboardListener};
 use log::{debug, error, info};
 use serde::Serialize;
 use specta::Type;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::settings::{self, get_settings, ShortcutBinding};
 
 use super::handler::handle_shortcut_event;
+
+/// The only window allowed to record shortcuts and receive the key events.
+const RECORDING_WINDOW: &str = "main";
+
+/// Recording a shortcut takes a few seconds. Past this, the user has walked
+/// away, and the global listener and suspended shortcuts shouldn't stay that way.
+const RECORDING_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often the recording loop checks that the main window still has focus.
+/// Each check is a round trip to the event loop, so it isn't done every poll.
+const FOCUS_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Commands that can be sent to the hotkey manager thread
 enum ManagerCommand {
@@ -70,6 +83,11 @@ pub struct HandyKeysState {
     recording_binding_id: Mutex<Option<String>>,
     /// Flag to stop recording loop
     recording_running: Arc<AtomicBool>,
+    /// Incremented on every start and stop, so a loop from an earlier
+    /// recording can't keep running or stop a newer one
+    recording_generation: AtomicU64,
+    /// Serializes start and stop, which can now come from the recording loop
+    recording_operation: Mutex<()>,
 }
 
 /// Key event sent to frontend during recording mode
@@ -103,6 +121,8 @@ impl HandyKeysState {
             is_recording: AtomicBool::new(false),
             recording_binding_id: Mutex::new(None),
             recording_running: Arc::new(AtomicBool::new(false)),
+            recording_generation: AtomicU64::new(0),
+            recording_operation: Mutex::new(()),
         })
     }
 
@@ -261,6 +281,10 @@ impl HandyKeysState {
 
     /// Start recording mode for a specific binding
     pub fn start_recording(&self, app: &AppHandle, binding_id: String) -> Result<(), String> {
+        let _operation = self
+            .recording_operation
+            .lock()
+            .map_err(|_| "Failed to lock recording_operation")?;
         if self.is_recording.load(Ordering::SeqCst) {
             return Err("Already recording".into());
         }
@@ -284,6 +308,12 @@ impl HandyKeysState {
             *binding = Some(binding_id);
         }
 
+        // Suspend every registered shortcut so a combo that overlaps an existing
+        // binding can't fire it (or have its keys swallowed) mid-capture.
+        // stop_recording resumes them, however recording ends.
+        super::suspend_all_shortcuts(app);
+
+        let generation = self.recording_generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.is_recording.store(true, Ordering::SeqCst);
         self.recording_running.store(true, Ordering::SeqCst);
 
@@ -291,7 +321,7 @@ impl HandyKeysState {
         let app_clone = app.clone();
         let recording_running = Arc::clone(&self.recording_running);
         thread::spawn(move || {
-            Self::recording_loop(app_clone, recording_running);
+            Self::recording_loop(app_clone, recording_running, generation);
         });
 
         debug!("Started handy-keys recording mode");
@@ -299,13 +329,31 @@ impl HandyKeysState {
     }
 
     /// Recording loop - emits key events to frontend during recording
-    fn recording_loop(app: AppHandle, running: Arc<AtomicBool>) {
+    fn recording_loop(app: AppHandle, running: Arc<AtomicBool>, generation: u64) {
+        let started = Instant::now();
+        // start_handy_keys_recording has just checked focus.
+        let mut focused = true;
+        let mut last_focus_check = started;
         while running.load(Ordering::SeqCst) {
+            let Some(state) = app.try_state::<HandyKeysState>() else {
+                break;
+            };
+            // A newer recording owns the listener now; leave it alone.
+            if state.recording_generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            if last_focus_check.elapsed() >= FOCUS_CHECK_INTERVAL {
+                last_focus_check = Instant::now();
+                focused = app
+                    .get_webview_window(RECORDING_WINDOW)
+                    .is_some_and(|w| is_focused_and_visible(&w));
+            }
+            if !recording_allowed(RECORDING_WINDOW, focused, started.elapsed()) {
+                debug!("Ending handy-keys recording: timed out or main window lost focus");
+                break;
+            }
+
             let event = {
-                let state = match app.try_state::<HandyKeysState>() {
-                    Some(s) => s,
-                    None => break,
-                };
                 let listener = state.recording_listener.lock().ok();
                 listener.as_ref().and_then(|l| l.as_ref()?.try_recv())
             };
@@ -322,21 +370,42 @@ impl HandyKeysState {
                         .unwrap_or_default(),
                 };
 
-                // Emit to frontend
-                if let Err(e) = app.emit("handy-keys-event", &frontend_event) {
+                // Only the main window records shortcuts; don't send keys to
+                // any other webview.
+                if let Err(e) = app.emit_to(RECORDING_WINDOW, "handy-keys-event", &frontend_event) {
                     error!("Failed to emit key event: {}", e);
                 }
             } else {
-                thread::sleep(std::time::Duration::from_millis(10));
+                thread::sleep(Duration::from_millis(10));
             }
         }
 
+        // Ending on our own (timeout, focus loss): clean up as if the frontend
+        // had asked. A no-op if it already did.
+        if let Some(state) = app.try_state::<HandyKeysState>() {
+            if let Err(e) = state.stop_recording(&app, Some(generation)) {
+                error!("Failed to stop handy-keys recording: {}", e);
+            }
+        }
         debug!("Recording loop ended");
     }
 
-    /// Stop recording mode
-    pub fn stop_recording(&self) -> Result<(), String> {
-        self.is_recording.store(false, Ordering::SeqCst);
+    /// Stop recording mode, resume shortcuts, and tell the frontend.
+    ///
+    /// With `Some(generation)`, only stops that recording, so a loop that
+    /// ends late can't stop a newer one. Does nothing if not recording.
+    fn stop_recording(&self, app: &AppHandle, generation: Option<u64>) -> Result<(), String> {
+        let _operation = self
+            .recording_operation
+            .lock()
+            .map_err(|_| "Failed to lock recording_operation")?;
+        if generation.is_some_and(|g| self.recording_generation.load(Ordering::SeqCst) != g) {
+            return Ok(());
+        }
+        if !self.is_recording.swap(false, Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.recording_generation.fetch_add(1, Ordering::SeqCst);
         self.recording_running.store(false, Ordering::SeqCst);
 
         {
@@ -352,6 +421,17 @@ impl HandyKeysState {
                 .lock()
                 .map_err(|_| "Failed to lock recording_binding_id")?;
             *binding = None;
+        }
+
+        // Restore shortcuts from settings regardless of how recording ended.
+        // A commit has already registered the new binding via change_binding;
+        // re-registering it here fails cleanly and is ignored.
+        super::resume_all_shortcuts(app);
+
+        // Lets the frontend reset its recorder when capture ended on the
+        // backend side (timeout, focus loss).
+        if let Err(e) = app.emit_to(RECORDING_WINDOW, "handy-keys-recording-stopped", ()) {
+            error!("Failed to emit recording stopped event: {}", e);
         }
 
         debug!("Stopped handy-keys recording mode");
@@ -473,10 +553,34 @@ pub fn unregister_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<
     state.unregister(&binding)
 }
 
+fn is_focused_and_visible(window: &tauri::WebviewWindow) -> bool {
+    window.is_focused().unwrap_or(false) && window.is_visible().unwrap_or(false)
+}
+
+/// Whether shortcut recording may start or continue: only for the main window,
+/// only while it is focused and visible, and only until `RECORDING_TIMEOUT`.
+fn recording_allowed(window_label: &str, focused_and_visible: bool, elapsed: Duration) -> bool {
+    window_label == RECORDING_WINDOW && focused_and_visible && elapsed < RECORDING_TIMEOUT
+}
+
 /// Start key recording mode
 #[tauri::command]
 #[specta::specta]
-pub fn start_handy_keys_recording(app: AppHandle, binding_id: String) -> Result<(), String> {
+pub fn start_handy_keys_recording(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    binding_id: String,
+) -> Result<(), String> {
+    // The recorder listens to the whole keyboard, so only the focused main
+    // window, where the user just clicked a shortcut, may start it.
+    if !recording_allowed(
+        window.label(),
+        is_focused_and_visible(&window),
+        Duration::ZERO,
+    ) {
+        return Err("Shortcut recording requires the focused main window".into());
+    }
+
     let settings = get_settings(&app);
     if settings.keyboard_implementation != settings::KeyboardImplementation::HandyKeys {
         return Err("handy-keys is not the active keyboard implementation".into());
@@ -496,15 +600,7 @@ pub fn start_handy_keys_recording(app: AppHandle, binding_id: String) -> Result<
         .try_state::<HandyKeysState>()
         .ok_or("HandyKeysState not initialized")?;
 
-    // Suspend every registered shortcut so a combo that overlaps an existing
-    // binding can't fire it (or have its keys swallowed) mid-capture.
-    super::suspend_all_shortcuts(&app);
-
-    let result = state.start_recording(&app, binding_id);
-    if result.is_err() {
-        super::resume_all_shortcuts(&app);
-    }
-    result
+    state.start_recording(&app, binding_id)
 }
 
 /// Stop key recording mode
@@ -520,10 +616,28 @@ pub fn stop_handy_keys_recording(app: AppHandle) -> Result<(), String> {
         .try_state::<HandyKeysState>()
         .ok_or("HandyKeysState not initialized")?;
 
-    // Restore shortcuts from settings regardless of how recording ended.
-    // A commit has already registered the new binding via change_binding;
-    // re-registering it here fails cleanly and is ignored.
-    let result = state.stop_recording();
-    super::resume_all_shortcuts(&app);
-    result
+    state.stop_recording(&app, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{recording_allowed, RECORDING_TIMEOUT};
+    use std::time::Duration;
+
+    #[test]
+    fn recording_is_limited_to_the_focused_main_window_and_times_out() {
+        assert!(recording_allowed("main", true, Duration::ZERO));
+        assert!(recording_allowed(
+            "main",
+            true,
+            RECORDING_TIMEOUT - Duration::from_millis(1)
+        ));
+        assert!(!recording_allowed(
+            "recording_overlay",
+            true,
+            Duration::ZERO
+        ));
+        assert!(!recording_allowed("main", false, Duration::ZERO));
+        assert!(!recording_allowed("main", true, RECORDING_TIMEOUT));
+    }
 }
