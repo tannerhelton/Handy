@@ -74,6 +74,55 @@ fn level_filter_from_u8(value: u8) -> log::LevelFilter {
     }
 }
 
+/// Enigo logs the full text it types at DEBUG (`text(text: ...)` on Windows,
+/// `fast_text(text: ...)` on macOS and Linux) and each typed character at
+/// DEBUG/TRACE on the per-key fallback. Drop its records below INFO before they
+/// reach any target, so transcripts typed with the Direct paste method never
+/// end up in the console, the log file or the webview, whatever the log level.
+fn log_record_allowed(metadata: &log::Metadata) -> bool {
+    let target = metadata.target();
+    let is_enigo = target == "enigo" || target.starts_with("enigo::");
+    !(is_enigo && metadata.level() > log::Level::Info)
+}
+
+#[cfg(test)]
+mod log_filter_tests {
+    use super::log_record_allowed;
+    use log::{Level, Metadata};
+
+    fn allowed(target: &str, level: Level) -> bool {
+        log_record_allowed(&Metadata::builder().target(target).level(level).build())
+    }
+
+    #[test]
+    fn drops_enigo_debug_and_trace() {
+        for target in [
+            "enigo",
+            "enigo::keycodes",
+            "enigo::platform",
+            "enigo::platform::macos_impl",
+            "enigo::platform::win_impl",
+        ] {
+            assert!(!allowed(target, Level::Debug), "{target} debug");
+            assert!(!allowed(target, Level::Trace), "{target} trace");
+        }
+    }
+
+    #[test]
+    fn keeps_enigo_info_and_above() {
+        for level in [Level::Info, Level::Warn, Level::Error] {
+            assert!(allowed("enigo::platform::macos_impl", level));
+        }
+    }
+
+    #[test]
+    fn keeps_other_debug_records() {
+        assert!(allowed("handy_app_lib::clipboard", Level::Debug));
+        assert!(allowed("handy_app_lib::input", Level::Trace));
+        assert!(allowed("enigo_like_crate", Level::Debug));
+    }
+}
+
 fn build_console_filter() -> env_filter::Filter {
     let mut builder = EnvFilterBuilder::new();
 
@@ -797,6 +846,7 @@ pub fn run(cli_args: CliArgs) {
         .plugin(
             LogBuilder::new()
                 .level(log::LevelFilter::Trace) // Set to most verbose level globally
+                .filter(log_record_allowed)
                 .max_file_size(500_000)
                 .rotation_strategy(RotationStrategy::KeepOne)
                 .clear_targets()
