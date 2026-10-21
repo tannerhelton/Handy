@@ -78,7 +78,8 @@ struct CatalogModel {
     /// HF repo id, e.g. `handy-computer/whisper-small-gguf`.
     repository: String,
     /// Commit the files and hashes are pinned to. Both HF acquisition and
-    /// mirror keys use it, so downloaded bytes provably match the hashes.
+    /// mirror keys use it, and every file Handy downloads from either is
+    /// checked against its size and sha256 here.
     revision: String,
     /// The loader architecture (`general.architecture`).
     family: String,
@@ -157,6 +158,7 @@ impl CatalogModel {
                 filename: file.filename.clone(),
                 quant: quant.clone(),
                 size_bytes: file.size,
+                sha256: file.sha256.clone(),
             })
             .collect();
         files.sort_by_key(|f| std::cmp::Reverse(f.size_bytes));
@@ -278,7 +280,7 @@ impl From<&CatalogModel> for ModelDescriptor {
             source: ModelSource::HuggingFace {
                 repo_id: m.repository.clone(),
                 // Acquire at the pin: `resolve/<sha>` is immutable (CDN-friendly)
-                // and guarantees the bytes match the catalog's hashes.
+                // and is the revision the catalog's hashes describe.
                 revision: m.revision.clone(),
             },
             name: m.name.clone(),

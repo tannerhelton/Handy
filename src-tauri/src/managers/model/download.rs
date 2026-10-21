@@ -1,7 +1,8 @@
 //! Shared direct-HTTP model download transport.
 //!
-//! Both legacy URL models and Hugging Face mirror fallbacks use this module;
-//! source-specific orchestration and finalization remain in the parent module.
+//! Both legacy URL models and Hugging Face mirror fallbacks use this module,
+//! and HF downloads borrow its verification; source-specific orchestration
+//! and finalization remain in the parent module.
 
 use super::{DownloadProgress, ModelManager};
 use anyhow::Result;
@@ -9,6 +10,7 @@ use futures_util::StreamExt;
 use hf_hub::api::tokio::CancellationToken;
 use log::{info, warn};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -119,6 +121,104 @@ impl ModelManager {
         Ok(())
     }
 
+    /// Map download notifications onto the Tauri events the frontend listens for.
+    fn tauri_events(&self, model_id: &str) -> impl Fn(HttpDownloadEvent<'_>) + Send + Sync {
+        let app_handle = self.app_handle.clone();
+        let id = model_id.to_string();
+        move |event| {
+            let _ = match event {
+                HttpDownloadEvent::Progress(progress) => {
+                    app_handle.emit("model-download-progress", progress)
+                }
+                HttpDownloadEvent::VerificationStarted => {
+                    app_handle.emit("model-verification-started", &id)
+                }
+                HttpDownloadEvent::VerificationCompleted => {
+                    app_handle.emit("model-verification-completed", &id)
+                }
+            };
+        }
+    }
+
+    /// [`Self::verify_hf_download_with_events`] wired to the Tauri event bus.
+    pub(super) async fn verify_hf_download(
+        &self,
+        model_id: &str,
+        pointer: &Path,
+        expected_size: u64,
+        expected_sha256: &str,
+    ) -> Result<()> {
+        Self::verify_hf_download_with_events(
+            model_id,
+            pointer,
+            expected_size,
+            expected_sha256,
+            &self.tauri_events(model_id),
+        )
+        .await
+    }
+
+    /// Check a file hf-hub reports as downloaded against the catalog. hf-hub
+    /// only uses the etag to name the blob and never hashes what it writes,
+    /// so this is the HF path's equivalent of the mirror's verification.
+    ///
+    /// On a mismatch the snapshot pointer is removed, and its blob with it
+    /// unless another snapshot still links to that blob (another tool sharing
+    /// the cache may own it). The caller then falls back to the mirror.
+    async fn verify_hf_download_with_events(
+        model_id: &str,
+        pointer: &Path,
+        expected_size: u64,
+        expected_sha256: &str,
+        emit: &(dyn Fn(HttpDownloadEvent<'_>) + Send + Sync),
+    ) -> Result<()> {
+        // Resolve the blob first: a failed hash check deletes the pointer,
+        // which is the only way to find it.
+        let deleting = HashSet::from([pointer.to_path_buf()]);
+        let blob = super::unshared_blob(pointer, &deleting).unwrap_or_else(|e| {
+            warn!("Keeping HF cache blob for {:?}: {}", pointer, e);
+            None
+        });
+
+        let result = match pointer.metadata().map(|m| m.len()) {
+            Ok(size) if size == expected_size => {
+                let verified =
+                    Self::verify_file_with_events(model_id, pointer, Some(expected_sha256), emit)
+                        .await;
+                if verified.is_err() {
+                    // Clear the "verifying" state so the mirror download that
+                    // follows shows its progress.
+                    emit(HttpDownloadEvent::VerificationCompleted);
+                }
+                verified
+            }
+            Ok(size) => {
+                let _ = fs::remove_file(pointer);
+                Err(anyhow::anyhow!(
+                    "Hugging Face download of {} is {} bytes, expected {}",
+                    model_id,
+                    size,
+                    expected_size
+                ))
+            }
+            Err(e) => {
+                let _ = fs::remove_file(pointer);
+                Err(anyhow::anyhow!(
+                    "Failed to read Hugging Face download of {}: {}",
+                    model_id,
+                    e
+                ))
+            }
+        };
+
+        if result.is_err() {
+            if let Some(blob) = blob {
+                let _ = fs::remove_file(blob);
+            }
+        }
+        result
+    }
+
     /// [`Self::download_http_resumable_with_events`] wired to the Tauri event
     /// bus — the production entry point.
     pub(super) async fn download_http_resumable(
@@ -130,8 +230,6 @@ impl ModelManager {
         expected_sha256: Option<&str>,
         cancel_token: &CancellationToken,
     ) -> Result<HttpDownloadOutcome> {
-        let app_handle = self.app_handle.clone();
-        let id = model_id.to_string();
         Self::download_http_resumable_with_events(
             model_id,
             url,
@@ -139,19 +237,7 @@ impl ModelManager {
             expected_size,
             expected_sha256,
             cancel_token,
-            &move |event| {
-                let _ = match event {
-                    HttpDownloadEvent::Progress(progress) => {
-                        app_handle.emit("model-download-progress", progress)
-                    }
-                    HttpDownloadEvent::VerificationStarted => {
-                        app_handle.emit("model-verification-started", &id)
-                    }
-                    HttpDownloadEvent::VerificationCompleted => {
-                        app_handle.emit("model-verification-completed", &id)
-                    }
-                };
-            },
+            &self.tauri_events(model_id),
         )
         .await
     }
