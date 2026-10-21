@@ -940,6 +940,10 @@ pub fn run(cli_args: CliArgs) {
                 return Ok(());
             }
 
+            if let Err(e) = portable::allow_recordings_access(app.handle()) {
+                log::error!("Failed to allow access to portable recordings: {e}");
+            }
+
             // Create main window programmatically so we can set data_directory
             // for portable mode (redirects WebView2 cache to portable Data dir)
             let mut win_builder =
