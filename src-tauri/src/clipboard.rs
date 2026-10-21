@@ -771,11 +771,36 @@ fn should_send_auto_submit(auto_submit: bool, paste_method: PasteMethod) -> bool
     auto_submit && paste_method != PasteMethod::None
 }
 
+/// Remove control characters before text reaches the focused app.
+///
+/// Typing tools turn characters like backspace (0x08), escape (0x1B) and
+/// delete (0x7F) into real key presses, and an escape sequence can end a
+/// terminal's bracketed paste. Line endings become `\n`, tabs are kept, and
+/// every other control character (C0, DEL, C1) is dropped. All other Unicode
+/// is left untouched.
+fn strip_control_chars(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .chars()
+        .filter_map(|c| match c {
+            '\r' => Some('\n'),
+            '\n' | '\t' => Some(c),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect()
+}
+
 pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
     let settings = get_settings(&app_handle);
     let paste_method = settings.paste_method;
     let paste_delay_ms = settings.paste_delay_ms;
     let paste_delay_after_ms = settings.paste_delay_after_ms;
+
+    let text = strip_control_chars(&text);
+    if text.is_empty() {
+        info!("Nothing left to paste after removing control characters");
+        return Ok(());
+    }
 
     // Append trailing space if setting is enabled
     let text = if settings.append_trailing_space {
@@ -962,6 +987,66 @@ e.g. 28:1 28:0 means pressing on the Enter button on a standard US keyboard.
         assert!(should_send_auto_submit(true, PasteMethod::Direct));
         assert!(should_send_auto_submit(true, PasteMethod::CtrlShiftV));
         assert!(should_send_auto_submit(true, PasteMethod::ShiftInsert));
+    }
+
+    #[test]
+    fn strips_editing_and_escape_characters() {
+        assert_eq!(strip_control_chars("Hello\u{8}\u{8} world"), "Hello world");
+        assert_eq!(strip_control_chars("abc\u{7f}def"), "abcdef");
+        assert_eq!(strip_control_chars("\u{0}null\u{0}"), "null");
+        assert_eq!(
+            strip_control_chars("before\u{1b}[201~\u{1b}[2Jafter"),
+            "before[201~[2Jafter"
+        );
+        assert_eq!(strip_control_chars("csi\u{9b}2J nel\u{85}"), "csi2J nel");
+    }
+
+    #[test]
+    fn normalizes_line_endings_and_keeps_tabs() {
+        assert_eq!(
+            strip_control_chars("one\r\ntwo\rthree\n"),
+            "one\ntwo\nthree\n"
+        );
+        assert_eq!(strip_control_chars("\r\n\r\n"), "\n\n");
+        assert_eq!(strip_control_chars("\r\r\n"), "\n\n");
+        assert_eq!(strip_control_chars("a\tb\n\tc"), "a\tb\n\tc");
+    }
+
+    #[test]
+    fn removes_every_c0_c1_and_del_except_newline_and_tab() {
+        for c in (0..=0x9f)
+            .filter_map(char::from_u32)
+            .filter(|c| c.is_control())
+        {
+            let result = strip_control_chars(&format!("a{c}b"));
+            match c {
+                '\n' | '\r' => assert_eq!(result, "a\nb"),
+                '\t' => assert_eq!(result, "a\tb"),
+                _ => assert_eq!(result, "ab", "U+{:04X} was not removed", c as u32),
+            }
+        }
+    }
+
+    #[test]
+    fn keeps_other_unicode_unchanged() {
+        let samples = [
+            "Grüße, ça va? Señor",
+            "你好，世界。日本語のテキスト",
+            "مرحبا بالعالم שלום",
+            "👍 🇺🇸 👨‍👩‍👧 👋🏽",
+            "zero\u{200B}width\u{200D}joiner\u{FEFF}",
+            "rtl \u{200E}mark\u{200F} and \u{202E}override\u{202C} \u{2067}isolate\u{2069}",
+            "non\u{a0}breaking and soft\u{ad}hyphen",
+        ];
+        for sample in samples {
+            assert_eq!(strip_control_chars(sample), sample);
+        }
+    }
+
+    #[test]
+    fn text_of_only_control_characters_becomes_empty() {
+        assert_eq!(strip_control_chars(""), "");
+        assert_eq!(strip_control_chars("\u{8}\u{1b}\u{7f}\u{85}"), "");
     }
 
     #[test]
