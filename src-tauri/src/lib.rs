@@ -18,6 +18,7 @@ mod memory;
 mod overlay;
 mod paste_tx;
 pub mod portable;
+mod private_data;
 mod secure_input;
 mod settings;
 mod shortcut;
@@ -621,6 +622,10 @@ fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run(cli_args: CliArgs) {
+    // Create settings, history, recordings and logs as owner-only (Unix).
+    // Must run before the log and store plugins create their files.
+    private_data::restrict_new_files();
+
     // Avoid ggml-metal residency-set teardown assertions when a native engine
     // outlives the Tauri shutdown sequence (#1902). This must happen before
     // transcribe-cpp initializes its Metal device. Advanced users can restore
@@ -897,6 +902,9 @@ pub fn run(cli_args: CliArgs) {
                 std::env::var_os("VK_LOADER_LAYERS_DISABLE"),
                 utils::env_flag_enabled("HANDY_KEEP_VULKAN_IMPLICIT_LAYERS"),
             );
+
+            // Data written by earlier versions may still be group/world-readable.
+            private_data::restrict_existing_data(app.handle());
 
             specta_builder.mount_events(app);
 
