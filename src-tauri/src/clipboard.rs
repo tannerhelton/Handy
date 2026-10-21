@@ -584,27 +584,45 @@ fn send_key_combo_via_wtype(paste_method: &PasteMethod) -> Result<(), String> {
     Ok(())
 }
 
+/// The dotool command that sends `paste_method` as a key combination.
+#[cfg(any(target_os = "linux", test))]
+fn dotool_key_command(paste_method: &PasteMethod) -> Result<&'static str, String> {
+    match paste_method {
+        PasteMethod::CtrlV => Ok("key ctrl+v"),
+        PasteMethod::ShiftInsert => Ok("key shift+insert"),
+        PasteMethod::CtrlShiftV => Ok("key ctrl+shift+v"),
+        _ => Err("Unsupported paste method".into()),
+    }
+}
+
 /// Send a key combination (e.g., Ctrl+V) via dotool.
 #[cfg(target_os = "linux")]
 fn send_key_combo_via_dotool(paste_method: &PasteMethod) -> Result<(), String> {
-    let command;
-    match paste_method {
-        PasteMethod::CtrlV => command = "echo key ctrl+v | dotool",
-        PasteMethod::ShiftInsert => command = "echo key shift+insert | dotool",
-        PasteMethod::CtrlShiftV => command = "echo key ctrl+shift+v | dotool",
-        _ => return Err("Unsupported paste method".into()),
-    }
+    use std::io::Write;
     use std::process::Stdio;
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(command)
+
+    let command = dotool_key_command(paste_method)?;
+
+    // dotool reads its commands from stdin, so no shell is needed.
+    let mut child = Command::new("dotool")
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .spawn()
         .map_err(|e| format!("Failed to execute dotool: {}", e))?;
+
+    // stdin is dropped when the match ends, so dotool sees EOF and exits.
+    let write_result = match child.stdin.take() {
+        Some(mut stdin) => writeln!(stdin, "{}", command),
+        None => Ok(()),
+    };
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to wait for dotool: {}", e))?;
     if !status.success() {
         return Err("dotool failed".into());
     }
+    write_result.map_err(|e| format!("Failed to write to dotool stdin: {}", e))?;
 
     Ok(())
 }
@@ -1011,5 +1029,22 @@ e.g. 28:1 28:0 means pressing on the Enter button on a standard US keyboard.
             .expect("external script should return without waiting for its child");
         fs::remove_file(script_path).expect("remove external script");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn generates_dotool_key_commands_for_all_paste_methods() {
+        assert_eq!(
+            dotool_key_command(&PasteMethod::CtrlV).unwrap(),
+            "key ctrl+v"
+        );
+        assert_eq!(
+            dotool_key_command(&PasteMethod::ShiftInsert).unwrap(),
+            "key shift+insert"
+        );
+        assert_eq!(
+            dotool_key_command(&PasteMethod::CtrlShiftV).unwrap(),
+            "key ctrl+shift+v"
+        );
+        assert!(dotool_key_command(&PasteMethod::Direct).is_err());
     }
 }
