@@ -2,8 +2,15 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { resolve } from "path";
+import tauriConfig from "./src-tauri/tauri.conf.json";
 
 const host = process.env.TAURI_DEV_HOST;
+
+// In `tauri dev` the webview loads pages straight from this server, so Tauri
+// never sees the response and can't apply `devCsp` itself. Send it from here.
+const devCsp = Object.entries(tauriConfig.app.security.devCsp)
+  .map(([directive, sources]) => `${directive} ${sources}`)
+  .join("; ");
 
 // https://vitejs.dev/config/
 export default defineConfig(async () => ({
@@ -36,6 +43,9 @@ export default defineConfig(async () => ({
     port: 1420,
     strictPort: true,
     host: host || false,
+    headers: {
+      "Content-Security-Policy": devCsp,
+    },
     hmr: host
       ? {
           protocol: "ws",
