@@ -549,6 +549,22 @@ async cancelOperation() : Promise<void> {
 async isPortable() : Promise<boolean> {
     return await TAURI_INVOKE("is_portable");
 },
+/**
+ * Download the update's NSIS installer for a portable install and start it.
+ * 
+ * The updater checks the installer's signature while downloading, and the
+ * same verified bytes are written to `Data/updates/` and run. The webview
+ * never sees a download URL, so a tampered update manifest can't point a
+ * portable user at an unsigned installer.
+ */
+async installPortableUpdate() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("install_portable_update") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async isUpdateChecksLocked() : Promise<boolean> {
     return await TAURI_INVOKE("is_update_checks_locked");
 },

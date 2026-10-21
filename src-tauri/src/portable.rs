@@ -115,6 +115,16 @@ pub fn store_path(relative: &str) -> PathBuf {
     }
 }
 
+/// Updater manifest key of the NSIS installer for this OS and architecture.
+/// Only the NSIS installer can update a portable install, so the updater is
+/// pinned to it instead of falling back to the MSI.
+pub fn update_target(os: &str, arch: &str) -> Option<String> {
+    match (os, arch) {
+        ("windows", "x86_64" | "aarch64") => Some(format!("windows-{arch}-nsis")),
+        _ => None,
+    }
+}
+
 /// Check if a marker file path contains the portable magic string.
 /// Extracted for testability.
 fn is_valid_portable_marker(path: &std::path::Path) -> bool {
@@ -193,5 +203,20 @@ mod tests {
         let data_dir = Path::new("portable-root").join("Data");
 
         assert_eq!(hugging_face_home(&data_dir), data_dir.join("huggingface"));
+    }
+
+    #[test]
+    fn test_update_target_is_the_nsis_installer() {
+        assert_eq!(
+            update_target("windows", "x86_64").as_deref(),
+            Some("windows-x86_64-nsis")
+        );
+        assert_eq!(
+            update_target("windows", "aarch64").as_deref(),
+            Some("windows-aarch64-nsis")
+        );
+        assert_eq!(update_target("windows", "x86"), None);
+        assert_eq!(update_target("macos", "aarch64"), None);
+        assert_eq!(update_target("linux", "x86_64"), None);
     }
 }

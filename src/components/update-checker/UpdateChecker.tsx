@@ -2,14 +2,14 @@ import React, { useState, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { listen } from "@tauri-apps/api/event";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { arch, platform } from "@tauri-apps/plugin-os";
 import { ProgressBar } from "../shared";
 import { useSettings } from "../../hooks/useSettings";
 import { commands } from "../../bindings";
 import {
-  resolvePortableInstallerUrl,
+  hasPortableInstaller,
   PORTABLE_RELEASES_URL,
 } from "./portableInstaller";
 
@@ -27,9 +27,7 @@ const UpdateChecker: React.FC<UpdateCheckerProps> = ({ className = "" }) => {
   const [showUpToDate, setShowUpToDate] = useState(false);
   const [showPortableUpdateDialog, setShowPortableUpdateDialog] =
     useState(false);
-  const [portableInstallerUrl, setPortableInstallerUrl] = useState<string>(
-    PORTABLE_RELEASES_URL,
-  );
+  const [hasDirectInstaller, setHasDirectInstaller] = useState(false);
 
   const { settings, isLoading, updateChecksLocked } = useSettings();
   // Wait for the lock state too (null = not loaded yet), otherwise the first
@@ -87,10 +85,10 @@ const UpdateChecker: React.FC<UpdateCheckerProps> = ({ className = "" }) => {
       if (update) {
         setUpdateAvailable(true);
         setShowUpToDate(false);
-        // Portable installs can't self-update in place — the manual dialog links
-        // straight at the matching installer from this manifest instead.
-        setPortableInstallerUrl(
-          resolvePortableInstallerUrl(update.rawJson, platform(), arch()),
+        // Portable installs can't self-update in place — the manual dialog runs
+        // the matching installer instead, if this manifest has one.
+        setHasDirectInstaller(
+          hasPortableInstaller(update.rawJson, platform(), arch()),
         );
       } else {
         setUpdateAvailable(false);
@@ -170,6 +168,29 @@ const UpdateChecker: React.FC<UpdateCheckerProps> = ({ className = "" }) => {
     }
   };
 
+  // The backend downloads the installer through the updater, which checks its
+  // signature, and starts it. Its URL never passes through the webview.
+  const installPortableUpdate = async () => {
+    setIsInstalling(true);
+    setDownloadProgress(0);
+    let unlisten: UnlistenFn | undefined;
+    try {
+      unlisten = await listen<number>("portable-update-progress", (event) =>
+        setDownloadProgress(event.payload),
+      );
+      const result = await commands.installPortableUpdate();
+      if (result.status === "error") {
+        console.error("Failed to install portable update:", result.error);
+      }
+    } catch (error) {
+      console.error("Failed to install portable update:", error);
+    } finally {
+      unlisten?.();
+      setIsInstalling(false);
+      setDownloadProgress(0);
+    }
+  };
+
   // Update status functions
   const getUpdateStatusText = () => {
     if (!updateChecksEnabled) {
@@ -202,10 +223,6 @@ const UpdateChecker: React.FC<UpdateCheckerProps> = ({ className = "" }) => {
   const isUpdateClickable =
     !isUpdateDisabled && (updateAvailable || (!isChecking && !showUpToDate));
 
-  // When no installer could be resolved for this target the button falls back to
-  // the releases index, so the dialog has to say "browse" rather than "download".
-  const hasDirectInstaller = portableInstallerUrl !== PORTABLE_RELEASES_URL;
-
   return (
     <>
       {showPortableUpdateDialog && (
@@ -229,8 +246,14 @@ const UpdateChecker: React.FC<UpdateCheckerProps> = ({ className = "" }) => {
               <button
                 className="px-3 py-1.5 text-sm rounded bg-logo-primary text-white hover:bg-logo-primary/80 transition-colors"
                 onClick={() => {
-                  openUrl(portableInstallerUrl);
                   setShowPortableUpdateDialog(false);
+                  // Without an installer for this target the button falls back
+                  // to the releases index, so the dialog says "browse" instead.
+                  if (hasDirectInstaller) {
+                    installPortableUpdate();
+                  } else {
+                    openUrl(PORTABLE_RELEASES_URL);
+                  }
                 }}
               >
                 {hasDirectInstaller
