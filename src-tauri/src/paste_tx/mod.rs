@@ -156,6 +156,28 @@ pub(crate) fn evaluate(state: &TxState, now: Instant) -> WaitDecision {
     WaitDecision::KeepWaiting
 }
 
+/// Whether a Windows clipboard format's handle is plain global memory that the
+/// snapshot can byte-copy and restore. Lives here rather than in the Windows
+/// module so it is unit-tested on every platform.
+///
+/// Everything else is skipped: GDI objects (CF_BITMAP has its own path),
+/// CF_METAFILEPICT (wraps a metafile handle that does not survive a byte
+/// copy), owner-display formats, private formats (0x0200..=0x02FF, whose
+/// handles are owner-defined values) and undefined values.
+#[cfg(any(target_os = "windows", test))]
+fn is_global_memory_format(format: u32) -> bool {
+    match format {
+        // CF_TEXT, CF_SYLK, CF_DIF, CF_TIFF, CF_OEMTEXT, CF_DIB, CF_PENDATA,
+        // CF_RIFF, CF_WAVE, CF_UNICODETEXT, CF_HDROP, CF_LOCALE, CF_DIBV5
+        1 | 4..=8 | 10..=13 | 15..=17 => true,
+        // CF_GDIOBJFIRST..=CF_GDIOBJLAST: documented as GlobalAlloc memory.
+        0x0300..=0x03FF => true,
+        // RegisterClipboardFormat
+        0xC000..=0xFFFF => true,
+        _ => false,
+    }
+}
+
 /// Modifier hold for the receipt-sequenced chord, kept at parity with the
 /// legacy path (100ms) for the beta: that hold was added in #165 because real
 /// users' systems dropped chords released too quickly, and the beta should
@@ -279,5 +301,24 @@ mod tests {
         let mut s = state_after_publish(Duration::from_millis(10));
         s.ownership_lost = true;
         assert!(matches!(evaluate(&s, Instant::now()), WaitDecision::Finish));
+    }
+
+    #[test]
+    fn snapshot_copies_only_global_memory_formats() {
+        // CF_TEXT, CF_DIB, CF_UNICODETEXT, CF_HDROP, CF_DIBV5, GDIOBJ range, registered
+        for format in [1, 8, 13, 15, 17, 0x0300, 0x03FF, 0xC000, 0xFFFF] {
+            assert!(is_global_memory_format(format), "format {format:#x}");
+        }
+        // CF_BITMAP, CF_METAFILEPICT, CF_PALETTE, CF_ENHMETAFILE, CF_OWNERDISPLAY,
+        // CF_DSPTEXT, CF_DSPBITMAP, CF_DSPMETAFILEPICT, CF_DSPENHMETAFILE, undefined
+        for format in [
+            0, 2, 3, 9, 14, 0x80, 0x81, 0x82, 0x83, 0x8E, 18, 0x0400, 0xBFFF, 0x10000,
+        ] {
+            assert!(!is_global_memory_format(format), "format {format:#x}");
+        }
+        // CF_PRIVATEFIRST..=CF_PRIVATELAST
+        for format in 0x0200..=0x02FF {
+            assert!(!is_global_memory_format(format), "format {format:#x}");
+        }
     }
 }
