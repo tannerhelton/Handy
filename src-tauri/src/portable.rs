@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tauri::Manager;
+use tauri_plugin_fs::FsExt;
 
 static PORTABLE_DATA_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 static PREVIOUS_HF_HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -69,6 +70,10 @@ fn hugging_face_home(data_dir: &Path) -> PathBuf {
     data_dir.join("huggingface")
 }
 
+fn recordings_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("recordings")
+}
+
 /// Returns `true` if running in portable mode.
 pub fn is_portable() -> bool {
     PORTABLE_DATA_DIR.get().and_then(|v| v.as_ref()).is_some()
@@ -78,6 +83,25 @@ pub fn is_portable() -> bool {
 /// Returns `None` when not in portable mode.
 pub fn data_dir() -> Option<&'static PathBuf> {
     PORTABLE_DATA_DIR.get().and_then(|v| v.as_ref())
+}
+
+/// Let the webview read recordings stored in the portable `Data/` dir.
+/// The asset protocol and fs scopes in the config only cover `$APPDATA`, and
+/// they cannot express a path relative to the executable, so history playback
+/// in portable mode needs this runtime grant. No-op when not portable.
+pub fn allow_recordings_access(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let Some(data_dir) = data_dir() else {
+        return Ok(());
+    };
+    let recordings_dir = recordings_dir(data_dir);
+
+    // convertFileSrc (macOS, Windows) goes through the asset protocol;
+    // readFile (Linux) goes through the fs plugin.
+    app.asset_protocol_scope()
+        .allow_directory(&recordings_dir, false)?;
+    app.fs_scope().allow_directory(&recordings_dir, false)?;
+
+    Ok(())
 }
 
 /// Portable-aware replacement for `app.path().app_data_dir()`.
@@ -193,5 +217,12 @@ mod tests {
         let data_dir = Path::new("portable-root").join("Data");
 
         assert_eq!(hugging_face_home(&data_dir), data_dir.join("huggingface"));
+    }
+
+    #[test]
+    fn test_recordings_dir_is_inside_portable_data() {
+        let data_dir = Path::new("portable-root").join("Data");
+
+        assert_eq!(recordings_dir(&data_dir), data_dir.join("recordings"));
     }
 }

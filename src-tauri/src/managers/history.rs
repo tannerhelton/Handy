@@ -6,7 +6,7 @@ use rusqlite_migration::{Migrations, M};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use tauri::AppHandle;
 use tauri_specta::Event;
 
@@ -63,6 +63,15 @@ pub struct HistoryEntry {
     pub post_processed_text: Option<String>,
     pub post_process_prompt: Option<String>,
     pub post_process_requested: bool,
+}
+
+/// True only when `file_name` is a single plain path component, so joining it
+/// onto the recordings directory cannot land anywhere else. `PathBuf::join`
+/// replaces the base when the argument is absolute and keeps `..`, and
+/// `get_audio_file_path` takes its name from the webview.
+fn is_plain_recording_file_name(file_name: &str) -> bool {
+    let mut components = Path::new(file_name).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
 }
 
 pub struct HistoryManager {
@@ -363,14 +372,17 @@ impl HistoryManager {
             )?;
 
             // Delete WAV file
-            let file_path = self.recordings_dir.join(file_name);
-            if file_path.exists() {
-                if let Err(e) = fs::remove_file(&file_path) {
-                    error!("Failed to delete WAV file {}: {}", file_name, e);
-                } else {
-                    debug!("Deleted old WAV file: {}", file_name);
-                    deleted_count += 1;
+            match self.get_audio_file_path(file_name) {
+                Ok(file_path) if file_path.exists() => {
+                    if let Err(e) = fs::remove_file(&file_path) {
+                        error!("Failed to delete WAV file {}: {}", file_name, e);
+                    } else {
+                        debug!("Deleted old WAV file: {}", file_name);
+                        deleted_count += 1;
+                    }
                 }
+                Ok(_) => {}
+                Err(e) => error!("Skipped deleting old WAV file: {}", e),
             }
         }
 
@@ -581,8 +593,13 @@ impl HistoryManager {
         Ok(())
     }
 
-    pub fn get_audio_file_path(&self, file_name: &str) -> PathBuf {
-        self.recordings_dir.join(file_name)
+    pub fn get_audio_file_path(&self, file_name: &str) -> Result<PathBuf> {
+        if !is_plain_recording_file_name(file_name) {
+            return Err(anyhow!(
+                "Refusing recording file name {file_name:?}: not a plain file name"
+            ));
+        }
+        Ok(self.recordings_dir.join(file_name))
     }
 
     pub async fn get_entry_by_id(&self, id: i64) -> Result<Option<HistoryEntry>> {
@@ -613,12 +630,15 @@ impl HistoryManager {
         // Get the entry to find the file name
         if let Some(entry) = self.get_entry_by_id(id).await? {
             // Delete the audio file first
-            let file_path = self.get_audio_file_path(&entry.file_name);
-            if file_path.exists() {
-                if let Err(e) = fs::remove_file(&file_path) {
-                    error!("Failed to delete audio file {}: {}", entry.file_name, e);
-                    // Continue with database deletion even if file deletion fails
+            match self.get_audio_file_path(&entry.file_name) {
+                Ok(file_path) if file_path.exists() => {
+                    if let Err(e) = fs::remove_file(&file_path) {
+                        error!("Failed to delete audio file {}: {}", entry.file_name, e);
+                        // Continue with database deletion even if file deletion fails
+                    }
                 }
+                Ok(_) => {}
+                Err(e) => error!("Skipped deleting audio file: {}", e),
             }
         }
 
@@ -697,6 +717,63 @@ mod tests {
             ],
         )
         .expect("insert history entry");
+    }
+
+    #[test]
+    fn generated_recording_names_are_plain_file_names() {
+        assert!(is_plain_recording_file_name("handy-1.wav"));
+        assert!(is_plain_recording_file_name("handy-1700000000.wav"));
+    }
+
+    #[test]
+    fn recording_names_that_would_escape_the_recordings_dir_are_rejected() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "../secret.wav",
+            "../../etc/passwd",
+            "nested/recording.wav",
+            "/etc/passwd",
+            "/absolute.wav",
+        ] {
+            assert!(
+                !is_plain_recording_file_name(name),
+                "{name:?} must not be treated as a recording file name"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_recording_names_that_would_escape_are_rejected() {
+        for name in [
+            "..\\secret.wav",
+            "nested\\recording.wav",
+            "C:\\Windows\\win.ini",
+            "C:recording.wav",
+            "\\\\server\\share\\recording.wav",
+        ] {
+            assert!(
+                !is_plain_recording_file_name(name),
+                "{name:?} must not be treated as a recording file name"
+            );
+        }
+    }
+
+    #[test]
+    fn join_discards_the_base_for_an_absolute_name() {
+        // An absolute argument makes join() drop the recordings directory,
+        // which is why get_audio_file_path rejects it.
+        let root = std::env::temp_dir().join("recordings");
+        let absolute = std::env::temp_dir().join("secret.txt");
+        let absolute = absolute.to_str().expect("utf-8 temp dir");
+
+        assert!(!root.join(absolute).starts_with(&root));
+        assert!(!is_plain_recording_file_name(absolute));
+
+        assert!(root.join("handy-1.wav").starts_with(&root));
+        assert!(is_plain_recording_file_name("handy-1.wav"));
     }
 
     #[test]

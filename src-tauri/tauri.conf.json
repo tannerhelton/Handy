@@ -17,8 +17,7 @@
       "assetProtocol": {
         "enable": true,
         "scope": {
-          "allow": ["**"],
-          "requireLiteralLeadingDot": false
+          "allow": ["$APPDATA/recordings/**"]
         }
       }
     }
