@@ -2,28 +2,31 @@ import React, { useState } from "react";
 import { Input } from "../../ui/Input";
 
 interface ApiKeyFieldProps {
-  value: string;
-  onBlur: (value: string) => void;
+  onSave: (value: string) => void;
   disabled: boolean;
   placeholder?: string;
   className?: string;
 }
 
+// The saved key is never sent to the webview, so this field always starts
+// empty. A non-empty value is saved on blur and then cleared from the input.
 export const ApiKeyField: React.FC<ApiKeyFieldProps> = React.memo(
-  ({ value, onBlur, disabled, placeholder, className = "" }) => {
-    const [localValue, setLocalValue] = useState(value);
-
-    // Sync with prop changes
-    React.useEffect(() => {
-      setLocalValue(value);
-    }, [value]);
+  ({ onSave, disabled, placeholder, className = "" }) => {
+    const [localValue, setLocalValue] = useState("");
 
     return (
       <Input
         type="password"
+        autoComplete="off"
         value={localValue}
         onChange={(event) => setLocalValue(event.target.value)}
-        onBlur={() => onBlur(localValue)}
+        onBlur={() => {
+          const trimmed = localValue.trim();
+          setLocalValue("");
+          if (trimmed) {
+            onSave(trimmed);
+          }
+        }}
         placeholder={placeholder}
         variant="compact"
         disabled={disabled}

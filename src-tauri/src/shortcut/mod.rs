@@ -1163,6 +1163,13 @@ pub fn change_post_process_api_key_setting(
     Ok(())
 }
 
+/// Whether a key is stored for the provider. The key itself is never returned.
+#[tauri::command]
+#[specta::specta]
+pub fn has_post_process_api_key(app: AppHandle, provider_id: String) -> bool {
+    settings::get_settings(&app).has_post_process_api_key(&provider_id)
+}
+
 #[tauri::command]
 #[specta::specta]
 pub fn change_post_process_model_setting(

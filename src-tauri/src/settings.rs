@@ -339,7 +339,7 @@ pub enum VadBackend {
     Earshot,
 }
 
-#[derive(Clone, Serialize, Deserialize, Type)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct SecretMap(HashMap<String, String>);
 
@@ -463,7 +463,10 @@ pub struct AppSettings {
     pub post_process_provider_id: String,
     #[serde(default = "default_post_process_providers")]
     pub post_process_providers: Vec<PostProcessProvider>,
+    /// Kept out of the TypeScript bindings and emptied by `for_webview`, so
+    /// key values never reach a webview. Only Rust code reads them.
     #[serde(default = "default_post_process_api_keys")]
+    #[specta(skip)]
     pub post_process_api_keys: SecretMap,
     #[serde(default = "default_post_process_models")]
     pub post_process_models: HashMap<String, String>,
@@ -1051,6 +1054,18 @@ impl AppSettings {
         self.post_process_providers
             .iter_mut()
             .find(|provider| provider.id == provider_id)
+    }
+
+    pub fn has_post_process_api_key(&self, provider_id: &str) -> bool {
+        self.post_process_api_keys
+            .get(provider_id)
+            .is_some_and(|key| !key.trim().is_empty())
+    }
+
+    /// The settings as sent to a webview: provider API keys are removed.
+    pub fn for_webview(mut self) -> Self {
+        self.post_process_api_keys.clear();
+        self
     }
 }
 
@@ -1832,6 +1847,24 @@ mod tests {
         assert!(!debug_output.contains("sk-proj-secret-key-12345"));
         assert!(!debug_output.contains("sk-ant-secret-key-67890"));
         assert!(debug_output.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn webview_settings_contain_no_api_keys() {
+        let mut settings = get_default_settings();
+        settings
+            .post_process_api_keys
+            .insert("openai".to_string(), "sk-proj-secret-key-12345".to_string());
+        assert!(settings.has_post_process_api_key("openai"));
+        assert!(!settings.has_post_process_api_key("anthropic"));
+
+        // The stored form still carries the key.
+        let stored = serde_json::to_string(&settings).unwrap();
+        assert!(stored.contains("sk-proj-secret-key-12345"));
+
+        let webview = serde_json::to_value(settings.for_webview()).unwrap();
+        assert!(!webview.to_string().contains("sk-proj-secret-key-12345"));
+        assert_eq!(webview["post_process_api_keys"], serde_json::json!({}));
     }
 
     #[test]
