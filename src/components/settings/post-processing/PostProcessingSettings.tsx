@@ -22,6 +22,9 @@ import { usePostProcessProviderState } from "../PostProcessingSettingsApi/usePos
 import { ShortcutInput } from "../ShortcutInput";
 import { useSettings } from "../../../hooks/useSettings";
 
+// Shown instead of the saved key, which the webview never receives.
+const SAVED_API_KEY_PLACEHOLDER = "••••••••";
+
 const PostProcessingSettingsApiComponent: React.FC = () => {
   const { t } = useTranslation();
   const state = usePostProcessProviderState();
@@ -121,14 +124,26 @@ const PostProcessingSettingsApiComponent: React.FC = () => {
           >
             <div className="flex items-center gap-2">
               <ApiKeyField
-                value={state.apiKey}
-                onBlur={state.handleApiKeyChange}
-                placeholder={t(
-                  "settings.postProcessing.api.apiKey.placeholder",
-                )}
+                key={state.selectedProviderId}
+                onSave={state.handleApiKeyChange}
+                placeholder={
+                  state.isApiKeySet
+                    ? SAVED_API_KEY_PLACEHOLDER
+                    : t("settings.postProcessing.api.apiKey.placeholder")
+                }
                 disabled={state.isApiKeyUpdating}
                 className="min-w-[320px]"
               />
+              {state.isApiKeySet && (
+                <Button
+                  variant="secondary"
+                  size="md"
+                  onClick={state.handleApiKeyClear}
+                  disabled={state.isApiKeyUpdating}
+                >
+                  {t("common.clear")}
+                </Button>
+              )}
             </div>
           </SettingContainer>
         </>

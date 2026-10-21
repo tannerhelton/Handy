@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useSettings } from "../../../hooks/useSettings";
 import {
   commands,
@@ -21,8 +21,9 @@ type PostProcessProviderState = {
   apiFormat: PostProcessApiFormat;
   handleApiFormatChange: (value: PostProcessApiFormat) => void;
   isApiFormatUpdating: boolean;
-  apiKey: string;
+  isApiKeySet: boolean;
   handleApiKeyChange: (value: string) => void;
+  handleApiKeyClear: () => void;
   isApiKeyUpdating: boolean;
   model: string;
   handleModelChange: (value: string) => void;
@@ -71,8 +72,23 @@ export const usePostProcessProviderState = (): PostProcessProviderState => {
   // Use settings directly as single source of truth
   const baseUrl = selectedProvider?.base_url ?? "";
   const apiFormat = selectedProvider?.api_format ?? "openai";
-  const apiKey = settings?.post_process_api_keys?.[selectedProviderId] ?? "";
   const model = settings?.post_process_models?.[selectedProviderId] ?? "";
+
+  // API keys are never sent to the webview; only whether one is set.
+  const [apiKeySet, setApiKeySet] = useState<Record<string, boolean>>({});
+  const isApiKeySet = apiKeySet[selectedProviderId] ?? false;
+
+  const refreshApiKeyStatus = useCallback(async (providerId: string) => {
+    const isSet = await commands.hasPostProcessApiKey(providerId);
+    setApiKeySet((prev) => ({ ...prev, [providerId]: isSet }));
+    return isSet;
+  }, []);
+
+  useEffect(() => {
+    if (!isAppleProvider) {
+      void refreshApiKeyStatus(selectedProviderId);
+    }
+  }, [isAppleProvider, refreshApiKeyStatus, selectedProviderId]);
 
   const providerOptions = useMemo<DropdownOption[]>(() => {
     return providers.map((provider) => ({
@@ -107,9 +123,8 @@ export const usePostProcessProviderState = (): PostProcessProviderState => {
       // to avoid unnecessary backend errors.
       if (providerId !== APPLE_PROVIDER_ID) {
         const provider = providers.find((p) => p.id === providerId);
-        const apiKey = settings?.post_process_api_keys?.[providerId] ?? "";
         const hasBaseUrl = (provider?.base_url ?? "").trim() !== "";
-        const hasApiKey = apiKey.trim() !== "";
+        const hasApiKey = await refreshApiKeyStatus(providerId);
 
         if (provider?.id === "custom" ? hasBaseUrl : hasApiKey) {
           void fetchPostProcessModels(providerId);
@@ -121,7 +136,7 @@ export const usePostProcessProviderState = (): PostProcessProviderState => {
       setPostProcessProvider,
       fetchPostProcessModels,
       providers,
-      settings,
+      refreshApiKeyStatus,
     ],
   );
 
@@ -148,14 +163,19 @@ export const usePostProcessProviderState = (): PostProcessProviderState => {
   );
 
   const handleApiKeyChange = useCallback(
-    (value: string) => {
+    async (value: string) => {
       const trimmed = value.trim();
-      if (trimmed !== apiKey) {
-        void updatePostProcessApiKey(selectedProviderId, trimmed);
-      }
+      if (!trimmed) return;
+      await updatePostProcessApiKey(selectedProviderId, trimmed);
+      await refreshApiKeyStatus(selectedProviderId);
     },
-    [apiKey, selectedProviderId, updatePostProcessApiKey],
+    [refreshApiKeyStatus, selectedProviderId, updatePostProcessApiKey],
   );
+
+  const handleApiKeyClear = useCallback(async () => {
+    await updatePostProcessApiKey(selectedProviderId, "");
+    await refreshApiKeyStatus(selectedProviderId);
+  }, [refreshApiKeyStatus, selectedProviderId, updatePostProcessApiKey]);
 
   const handleModelChange = useCallback(
     (value: string) => {
@@ -243,8 +263,9 @@ export const usePostProcessProviderState = (): PostProcessProviderState => {
     apiFormat,
     handleApiFormatChange,
     isApiFormatUpdating,
-    apiKey,
+    isApiKeySet,
     handleApiKeyChange,
+    handleApiKeyClear,
     isApiKeyUpdating,
     model,
     handleModelChange,
