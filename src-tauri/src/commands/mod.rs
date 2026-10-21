@@ -22,6 +22,77 @@ pub fn is_portable() -> bool {
     crate::portable::is_portable()
 }
 
+/// Download the update's NSIS installer for a portable install and start it.
+///
+/// The updater checks the installer's signature while downloading, and the
+/// same verified bytes are written to `Data/updates/` and run. The webview
+/// never sees a download URL, so a tampered update manifest can't point a
+/// portable user at an unsigned installer.
+#[specta::specta]
+#[tauri::command]
+pub async fn install_portable_update(app: AppHandle) -> Result<(), String> {
+    use tauri::Emitter;
+    use tauri_plugin_updater::UpdaterExt;
+
+    let Some(data_dir) = crate::portable::data_dir() else {
+        return Err("Not a portable install".to_string());
+    };
+    if !crate::settings::update_checks_effectively_enabled(&get_settings(&app)) {
+        return Err("Update checks are disabled".to_string());
+    }
+    let target = crate::portable::update_target(std::env::consts::OS, std::env::consts::ARCH)
+        .ok_or("No portable installer for this platform")?;
+
+    let update = app
+        .updater_builder()
+        .target(target)
+        .build()
+        .map_err(|e| format!("Failed to create updater: {}", e))?
+        .check()
+        .await
+        .map_err(|e| format!("Failed to check for updates: {}", e))?
+        .ok_or("No update available")?;
+
+    let mut downloaded: u64 = 0;
+    let mut last_progress = None;
+    let bytes = update
+        .download(
+            |chunk_length, content_length| {
+                downloaded += chunk_length as u64;
+                if let Some(total) = content_length.filter(|&total| total > 0) {
+                    let progress = (downloaded * 100 / total).min(100);
+                    if last_progress != Some(progress) {
+                        last_progress = Some(progress);
+                        let _ = app.emit("portable-update-progress", progress);
+                    }
+                }
+            },
+            || {},
+        )
+        .await
+        .map_err(|e| format!("Failed to download update: {}", e))?;
+
+    // Write the verified bytes on every attempt rather than reusing a file
+    // already on disk, so the installer that runs is the one just checked.
+    let updates_dir = data_dir.join("updates");
+    std::fs::create_dir_all(&updates_dir)
+        .map_err(|e| format!("Failed to create updates directory: {}", e))?;
+    let installer_path = updates_dir.join("Handy-setup.exe");
+    let partial_path = updates_dir.join("Handy-setup.exe.part");
+    std::fs::write(&partial_path, &bytes)
+        .and_then(|_| std::fs::rename(&partial_path, &installer_path))
+        .map_err(|e| format!("Failed to save installer: {}", e))?;
+
+    log::info!(
+        "Starting verified installer for v{}: {}",
+        update.version,
+        installer_path.display()
+    );
+    app.opener()
+        .open_path(installer_path.to_string_lossy(), None::<String>)
+        .map_err(|e| format!("Failed to start installer: {}", e))
+}
+
 #[tauri::command]
 #[specta::specta]
 pub fn is_update_checks_locked() -> bool {
