@@ -102,14 +102,15 @@ fn canonicalize_supported_languages(languages: Vec<String>) -> Vec<String> {
     canonical
 }
 
-/// One downloadable quantization of a catalog model. (Its sha256, the trust
-/// anchor for mirror downloads, stays in the catalog: see
-/// `catalog::mirror_fallbacks`.)
+/// One downloadable quantization of a catalog model.
 #[derive(Debug, Clone)]
 pub struct QuantFile {
     pub filename: String,
     pub quant: String,
     pub size_bytes: u64,
+    /// Content hash from the catalog: the trust anchor that HF and mirror
+    /// downloads are both checked against.
+    pub sha256: String,
 }
 
 /// Pick the default quant among `files`: the one whose `quant` matches
@@ -1729,6 +1730,15 @@ impl ModelManager {
             model_id, repo_id, revision, filename
         );
 
+        // The catalog's size and sha256 for this file at its pinned revision.
+        // Files outside the catalog have nothing to be checked against.
+        let expected = crate::catalog::file_in_catalog(&filename, Some(&repo_id))
+            .filter(|(desc, _)| match &desc.source {
+                ModelSource::HuggingFace { revision: pin, .. } => *pin == revision,
+                _ => false,
+            })
+            .map(|(_, file)| file);
+
         // hf-hub has no working internal retry (its retry knobs are hardcoded
         // to zero), so a single transient fault — dropped connection, a 429
         // from the resolve endpoint, a CDN blip — would otherwise fail the
@@ -1815,7 +1825,18 @@ impl ModelManager {
             watchdog.abort();
 
             match result {
-                Ok(_) => break None,
+                Ok(path) => {
+                    // hf-hub doesn't hash what it downloads. A file that fails
+                    // the catalog check is treated like a failed download, so
+                    // the verified mirror fallback below takes over.
+                    let Some(file) = expected else {
+                        break None;
+                    };
+                    break self
+                        .verify_hf_download(&model_id, &path, file.size_bytes, &file.sha256)
+                        .await
+                        .err();
+                }
                 Err(hf_hub::api::tokio::ApiError::Cancelled) if cancel_token.is_cancelled() => {
                     // User cancelled. hf-hub leaves the partially downloaded
                     // `.sync.part` in the shared cache, so a later attempt resumes
@@ -2808,11 +2829,13 @@ mod tests {
                     filename: "model-Q4_K_M.gguf".to_string(),
                     quant: "Q4_K_M".to_string(),
                     size_bytes: 1,
+                    sha256: String::new(),
                 },
                 QuantFile {
                     filename: "model-Q8_0.gguf".to_string(),
                     quant: "Q8_0".to_string(),
                     size_bytes: 2,
+                    sha256: String::new(),
                 },
             ],
             default_quant: Some("Q8_0".to_string()),

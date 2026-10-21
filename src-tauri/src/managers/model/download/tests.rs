@@ -577,3 +577,190 @@ async fn http_cancel_during_stalled_body_keeps_partial() {
         "bytes received before the cancel must be kept for resume"
     );
 }
+
+// ── Hugging Face download verification tests ─────────────────────────────
+//
+// A real hf-hub client downloads into a temp cache from a local stand-in for
+// the HF resolve endpoint, so the snapshot pointer and blob layout under test
+// is exactly what hf-hub writes.
+
+const HF_REPO: &str = "someone/model-gguf";
+const HF_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+const HF_FILE: &str = "model.gguf";
+
+/// Answer every request with the requested range of `body` and the headers
+/// hf-hub reads for its metadata. Like HF, the etag (which names the blob)
+/// is the sha256 of what is served. Serves until the test ends.
+async fn serve_hf(body: &'static [u8]) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let head = read_request_head(&mut sock).await.to_lowercase();
+                let last = body.len() - 1;
+                let (start, end) = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("range: bytes="))
+                    .and_then(|range| range.split_once('-'))
+                    .map(|(a, b)| (a.parse().unwrap(), b.parse::<usize>().unwrap().min(last)))
+                    .unwrap_or((0, last));
+                let response = http_response(
+                    "206 Partial Content",
+                    &[
+                        format!("X-Repo-Commit: {HF_COMMIT}"),
+                        format!("X-Linked-Etag: \"{}\"", sha_hex(body)),
+                        format!("X-Linked-Size: {}", body.len()),
+                        format!("Content-Range: bytes {start}-{end}/{}", body.len()),
+                        format!("Content-Length: {}", end + 1 - start),
+                    ],
+                    &body[start..=end],
+                );
+                let _ = sock.write_all(&response).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// Download `HF_FILE` through hf-hub into `cache`; returns the snapshot path.
+async fn hf_download(endpoint: String, cache: &Path) -> std::path::PathBuf {
+    let api = hf_hub::api::tokio::ApiBuilder::new()
+        .with_endpoint(endpoint)
+        .with_cache_dir(cache.to_path_buf())
+        .with_token(None)
+        .with_progress(false)
+        .build()
+        .unwrap();
+    api.repo(hf_hub::Repo::with_revision(
+        HF_REPO.to_string(),
+        hf_hub::RepoType::Model,
+        HF_COMMIT.to_string(),
+    ))
+    .download(HF_FILE)
+    .await
+    .unwrap()
+}
+
+/// The blob hf-hub stored `body` under.
+fn hf_blob(cache: &Path, body: &[u8]) -> std::path::PathBuf {
+    cache
+        .join(format!("models--{}", HF_REPO.replace('/', "--")))
+        .join("blobs")
+        .join(sha_hex(body))
+}
+
+async fn verify_hf(
+    pointer: &Path,
+    expected: &[u8],
+    events: &std::sync::Mutex<Vec<&'static str>>,
+) -> Result<()> {
+    ModelManager::verify_hf_download_with_events(
+        "test/model",
+        pointer,
+        expected.len() as u64,
+        &sha_hex(expected),
+        &|event| {
+            events.lock().unwrap().push(match event {
+                HttpDownloadEvent::Progress(_) => "progress",
+                HttpDownloadEvent::VerificationStarted => "started",
+                HttpDownloadEvent::VerificationCompleted => "completed",
+            })
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn hf_download_matching_the_catalog_is_kept() {
+    let body: &[u8] = b"the real model";
+    let cache = TempDir::new().unwrap();
+    let pointer = hf_download(serve_hf(body).await, cache.path()).await;
+    let events = Default::default();
+
+    verify_hf(&pointer, body, &events).await.unwrap();
+
+    assert_eq!(fs::read(&pointer).unwrap(), body);
+    assert_eq!(*events.lock().unwrap(), ["started", "completed"]);
+}
+
+#[tokio::test]
+async fn hf_substituted_download_is_removed_and_mirror_used() {
+    let body: &[u8] = b"the real model";
+    let tampered: &[u8] = b"not the model!";
+    let cache = TempDir::new().unwrap();
+    let pointer = hf_download(serve_hf(tampered).await, cache.path()).await;
+    let events = Default::default();
+
+    let err = verify_hf(&pointer, body, &events).await.unwrap_err();
+
+    assert!(err.to_string().contains("corrupt"), "{err}");
+    assert!(fs::symlink_metadata(&pointer).is_err(), "pointer kept");
+    assert!(!hf_blob(cache.path(), tampered).exists(), "blob kept");
+    // "verifying" is cleared so the mirror download shows its progress.
+    assert_eq!(*events.lock().unwrap(), ["started", "completed"]);
+
+    // The caller falls back to the mirror, which verifies the same hash.
+    let (url, _server) = serve_once(http_response(
+        "200 OK",
+        &[format!("Content-Length: {}", body.len())],
+        body,
+    ))
+    .await;
+    let partial = cache.path().join("model.gguf.partial");
+    let out = run_download(
+        &url,
+        &partial,
+        Some(body.len() as u64),
+        Some(&sha_hex(body)),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(out, HttpDownloadOutcome::Completed));
+    assert_eq!(fs::read(&partial).unwrap(), body);
+}
+
+#[tokio::test]
+async fn hf_download_of_the_wrong_size_is_rejected_without_hashing() {
+    let body: &[u8] = b"the real model";
+    let truncated: &[u8] = b"the real";
+    let cache = TempDir::new().unwrap();
+    let pointer = hf_download(serve_hf(truncated).await, cache.path()).await;
+    let events = Default::default();
+
+    let err = verify_hf(&pointer, body, &events).await.unwrap_err();
+
+    assert!(err.to_string().contains("expected 14"), "{err}");
+    assert!(fs::symlink_metadata(&pointer).is_err(), "pointer kept");
+    assert!(!hf_blob(cache.path(), truncated).exists(), "blob kept");
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "hashed a wrong-size file"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hf_mismatch_keeps_a_blob_another_snapshot_links_to() {
+    // Another tool sharing the cache has the same blob at another revision.
+    // Only Handy's pointer goes; the blob and the other pointer stay.
+    let body: &[u8] = b"the real model";
+    let tampered: &[u8] = b"not the model!";
+    let cache = TempDir::new().unwrap();
+    let pointer = hf_download(serve_hf(tampered).await, cache.path()).await;
+    let blob = hf_blob(cache.path(), tampered);
+    let snapshots = pointer.parent().unwrap().parent().unwrap();
+    let other = snapshots.join("other-revision").join(HF_FILE);
+    fs::create_dir_all(other.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&blob, &other).unwrap();
+
+    assert!(verify_hf(&pointer, body, &Default::default())
+        .await
+        .is_err());
+
+    assert!(fs::symlink_metadata(&pointer).is_err(), "pointer kept");
+    assert!(blob.exists(), "shared blob deleted");
+    assert_eq!(fs::read(&other).unwrap(), tampered);
+}
