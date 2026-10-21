@@ -677,24 +677,104 @@ fn send_key_combo_via_xdotool(paste_method: &PasteMethod) -> Result<(), String> 
     Ok(())
 }
 
+/// Checks that an external paste script is an absolute path to an executable
+/// regular file (symlinks are followed) that other users cannot modify.
+pub(crate) fn validate_external_script_path(script_path: &str) -> Result<(), String> {
+    let path = std::path::Path::new(script_path);
+    if !path.is_absolute() {
+        return Err(format!(
+            "External script path '{}' must be absolute",
+            script_path
+        ));
+    }
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| format!("Cannot access external script '{}': {}", script_path, e))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "External script '{}' is not a regular file",
+            script_path
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let mode = metadata.mode();
+        if mode & 0o111 == 0 {
+            return Err(format!(
+                "External script '{}' is not executable",
+                script_path
+            ));
+        }
+
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        if metadata.uid() != euid && metadata.uid() != 0 {
+            return Err(format!(
+                "External script '{}' must be owned by you or root",
+                script_path
+            ));
+        }
+
+        // With user private groups (the default on Debian, Ubuntu and Fedora)
+        // new files are group-writable, but by convention that group has the
+        // user's id and no other members, so allow group write in that case.
+        let private_group = metadata.uid() == euid && metadata.gid() == euid;
+        if mode & 0o002 != 0 || (mode & 0o020 != 0 && !private_group) {
+            return Err(format!(
+                "External script '{}' must not be writable by other users",
+                script_path
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Pastes text by invoking an external script.
-/// The script receives the text to paste as a single argument.
+/// The script receives the text to paste on stdin and as its first argument.
+/// Stdin is preferred: arguments are visible to other users in the process list.
 fn paste_via_external_script(text: &str, script_path: &str) -> Result<(), String> {
     info!("Pasting via external script: {}", script_path);
+    validate_external_script_path(script_path)?;
 
-    // Do not capture the script's stdio. Wayland clipboard helpers such as
-    // wl-copy may fork a background selection daemon that inherits those file
-    // descriptors; waiting for captured output would then block until the
-    // clipboard selection is replaced instead of returning after the script
-    // itself exits.
+    // Do not capture the script's stdout or stderr. Wayland clipboard helpers
+    // such as wl-copy may fork a background selection daemon that inherits
+    // those file descriptors; waiting for captured output would then block
+    // until the clipboard selection is replaced instead of returning after the
+    // script itself exits.
+    use std::io::Write;
     use std::process::Stdio;
-    let status = Command::new(script_path)
+    let mut child = Command::new(script_path)
         .arg(text)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .spawn()
         .map_err(|e| format!("Failed to execute external script '{}': {}", script_path, e))?;
+
+    // Dropping stdin after the write closes it, so scripts reading to EOF finish.
+    // Scripts that only use $1 may exit without reading stdin, which is fine.
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(e) = stdin.write_all(text.as_bytes()) {
+            if e.kind() != std::io::ErrorKind::BrokenPipe {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "Failed to write to external script '{}': {}",
+                    script_path, e
+                ));
+            }
+        }
+    }
+
+    let status = child.wait().map_err(|e| {
+        format!(
+            "Failed to wait for external script '{}': {}",
+            script_path, e
+        )
+    })?;
 
     if !status.success() {
         return Err(format!(
@@ -973,6 +1053,84 @@ e.g. 28:1 28:0 means pressing on the Enter button on a standard US keyboard.
 
         assert_eq!(result.unwrap_err(), "input failed");
         assert!(restored.get());
+    }
+
+    #[test]
+    fn external_script_rejects_relative_and_missing_paths() {
+        assert!(validate_external_script_path("paste.sh").is_err());
+        assert!(validate_external_script_path("./paste.sh").is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.sh");
+        assert!(validate_external_script_path(missing.to_str().unwrap()).is_err());
+        assert!(validate_external_script_path(directory.path().to_str().unwrap()).is_err());
+    }
+
+    #[cfg(unix)]
+    fn write_script(directory: &std::path::Path, body: &str, mode: u32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = directory.join("paste.sh");
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_script_must_be_executable_and_not_writable_by_others() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_script(directory.path(), "#!/bin/sh\n", 0o700);
+        let path_str = path.to_str().unwrap();
+        assert!(validate_external_script_path(path_str).is_ok());
+
+        let link = directory.path().join("link.sh");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(validate_external_script_path(link.to_str().unwrap()).is_ok());
+
+        write_script(directory.path(), "#!/bin/sh\n", 0o600);
+        assert!(validate_external_script_path(path_str).is_err());
+        write_script(directory.path(), "#!/bin/sh\n", 0o702);
+        assert!(validate_external_script_path(path_str).is_err());
+        assert!(validate_external_script_path(link.to_str().unwrap()).is_err());
+
+        // Group write is only allowed for a user private group.
+        write_script(directory.path(), "#!/bin/sh\n", 0o770);
+        let metadata = std::fs::metadata(&path).unwrap();
+        let private_group = metadata.gid() == metadata.uid();
+        assert_eq!(
+            validate_external_script_path(path_str).is_ok(),
+            private_group
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_script_accepts_root_owned_programs() {
+        assert!(validate_external_script_path("/bin/sh").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_script_receives_text_on_stdin_and_as_argument() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_script(
+            directory.path(),
+            "#!/bin/sh\ntest \"$1\" = 'hello world' && test \"$(cat)\" = 'hello world'\n",
+            0o700,
+        );
+        assert!(paste_via_external_script("hello world", path.to_str().unwrap()).is_ok());
+        assert!(paste_via_external_script("something else", path.to_str().unwrap()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_script_may_ignore_stdin() {
+        // Larger than a pipe buffer, so the write fails once the script exits,
+        // but within Linux's 128 KiB limit for a single argument.
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_script(directory.path(), "#!/bin/sh\nexit 0\n", 0o700);
+        let text = "a".repeat(100_000);
+        assert!(paste_via_external_script(&text, path.to_str().unwrap()).is_ok());
     }
 
     #[cfg(unix)]

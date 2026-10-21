@@ -157,6 +157,11 @@ For reliable text input on Linux, install the appropriate tool for your display 
 
 Without these tools, Handy falls back to enigo which may have limited compatibility, especially on Wayland.
 
+**External Script Paste Method:**
+
+- Handy runs the script and passes the transcript both on stdin and as the first argument (`$1`). Prefer reading stdin: command-line arguments are visible to other users in the process list.
+- The path must be absolute and point to an executable file owned by you or root that other users cannot modify. It is checked when you leave the path field and again before each paste.
+
 **Wayland Support (Linux):**
 
 - Limited support for Wayland display server
