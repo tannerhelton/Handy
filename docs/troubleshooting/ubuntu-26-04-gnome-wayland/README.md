@@ -83,7 +83,7 @@ Create `~/.local/bin/handy-paste`, here for bépo:
 
 ```sh
 #!/bin/sh
-printf '%s' "$1" | wl-copy
+wl-copy
 sleep 0.1
 ydotool key 29:1 22:1 22:0 29:0
 ```
@@ -92,4 +92,4 @@ ydotool key 29:1 22:1 22:0 29:0
 chmod +x ~/.local/bin/handy-paste
 ```
 
-Set **Paste Method** to **External Script** with this path.
+Handy passes the text on stdin, which `wl-copy` reads. Set **Paste Method** to **External Script** with the full path, for example `/home/you/.local/bin/handy-paste`.

@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Dropdown, type DropdownOption } from "../ui/Dropdown";
 import { SettingContainer } from "../ui/SettingContainer";
@@ -78,6 +78,12 @@ export const PasteMethodSetting: React.FC<PasteMethodProps> = React.memo(
     };
 
     const externalScriptPath = getSetting("external_script_path") || "";
+    // Save on blur rather than on every keystroke, so a partially typed path
+    // is never stored or run.
+    const [localScriptPath, setLocalScriptPath] = useState(externalScriptPath);
+    useEffect(() => {
+      setLocalScriptPath(externalScriptPath);
+    }, [externalScriptPath]);
 
     const pasteMethodOptions = getPasteMethodOptions(osType);
 
@@ -101,10 +107,13 @@ export const PasteMethodSetting: React.FC<PasteMethodProps> = React.memo(
           {selectedMethod === "external_script" && (
             <Input
               type="text"
-              value={externalScriptPath}
-              onChange={(e) =>
-                updateSetting("external_script_path", e.target.value)
-              }
+              value={localScriptPath}
+              onChange={(e) => setLocalScriptPath(e.target.value)}
+              onBlur={() => {
+                if (localScriptPath !== externalScriptPath) {
+                  updateSetting("external_script_path", localScriptPath);
+                }
+              }}
               placeholder={t(
                 "settings.advanced.pasteMethod.externalScriptPlaceholder",
               )}

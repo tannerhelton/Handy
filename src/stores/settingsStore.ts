@@ -151,8 +151,15 @@ const settingUpdaters: {
     commands.changeReliablePasteSetting(value as boolean),
   paste_method: (value) => commands.changePasteMethodSetting(value as string),
   typing_tool: (value) => commands.changeTypingToolSetting(value as string),
-  external_script_path: (value) =>
-    commands.changeExternalScriptPathSetting(value as string | null),
+  external_script_path: async (value) => {
+    const result = await commands.changeExternalScriptPathSetting(
+      value as string | null,
+    );
+    if (result.status === "error") {
+      toast.error(result.error);
+      throw new Error(result.error);
+    }
+  },
   clipboard_handling: (value) =>
     commands.changeClipboardHandlingSetting(value as string),
   auto_submit: (value) => commands.changeAutoSubmitSetting(value as boolean),

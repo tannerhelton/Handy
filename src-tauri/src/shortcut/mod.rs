@@ -995,6 +995,9 @@ pub fn change_external_script_path_setting(
     app: AppHandle,
     path: Option<String>,
 ) -> Result<(), String> {
+    if let Some(path) = path.as_deref().filter(|p| !p.is_empty()) {
+        crate::clipboard::validate_external_script_path(path)?;
+    }
     let mut settings = settings::get_settings(&app);
     settings.external_script_path = path;
     settings::write_settings(&app, settings);
