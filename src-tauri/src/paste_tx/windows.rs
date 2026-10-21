@@ -25,7 +25,7 @@ use windows::Win32::Foundation::{
     SetLastError, ERROR_SUCCESS, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
 };
 
-use super::{evaluate, send_chord, TxState, WaitDecision};
+use super::{evaluate, is_global_memory_format, send_chord, TxState, WaitDecision};
 use crate::clipboard::send_return_key;
 use crate::input::EnigoState;
 use crate::settings::{AutoSubmitKey, ClipboardHandling, PasteMethod};
@@ -38,10 +38,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
-use windows::Win32::System::Ole::{
-    CF_BITMAP, CF_DSPBITMAP, CF_DSPENHMETAFILE, CF_DSPMETAFILEPICT, CF_DSPTEXT, CF_ENHMETAFILE,
-    CF_OWNERDISPLAY, CF_PALETTE, CF_UNICODETEXT,
-};
+use windows::Win32::System::Ole::{CF_BITMAP, CF_UNICODETEXT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CopyImage, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetWindowLongPtrW, KillTimer, PostQuitMessage, RegisterClassW, SetTimer, SetWindowLongPtrW,
@@ -317,16 +314,10 @@ unsafe fn snapshot_clipboard(hwnd: HWND, shared: &WinTxShared) -> Result<(), Str
             }
             continue;
         }
-        // Formats whose handles are not plain global memory cannot be
-        // byte-copied; skipping them matches what the legacy path restored.
-        if format == CF_ENHMETAFILE.0 as u32
-            || format == CF_DSPENHMETAFILE.0 as u32
-            || format == CF_DSPBITMAP.0 as u32
-            || format == CF_DSPMETAFILEPICT.0 as u32
-            || format == CF_DSPTEXT.0 as u32
-            || format == CF_OWNERDISPLAY.0 as u32
-            || format == CF_PALETTE.0 as u32
-        {
+        // Only global-memory handles can be byte-copied. Anything else (GDI
+        // objects, private formats) is not an HGLOBAL, so reading it as one
+        // could touch arbitrary memory.
+        if !is_global_memory_format(format) {
             continue;
         }
         if let Ok(handle) = GetClipboardData(format) {
