@@ -1,4 +1,5 @@
 use crate::settings::{PostProcessApiFormat, PostProcessProvider};
+use futures_util::StreamExt;
 use log::{debug, error, info};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, REFERER, USER_AGENT};
 use serde::{Deserialize, Serialize};
@@ -6,6 +7,15 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::sync::{Mutex, OnceLock};
+
+const MAX_REDIRECTS: usize = 10;
+/// Upper bound on a completion response. Post-processing output is a few KB.
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+/// Model lists can be much larger: OpenRouter's is already close to 1 MB.
+const MAX_MODEL_LIST_BYTES: usize = 16 * 1024 * 1024;
+/// How much of a provider's error body is kept in the returned error, enough
+/// for messages such as "model not found".
+const ERROR_BODY_SNIPPET_BYTES: usize = 512;
 
 #[derive(Debug, Serialize)]
 struct ChatMessage {
@@ -220,8 +230,112 @@ fn create_client(provider: &PostProcessProvider, api_key: &str) -> Result<reqwes
     let headers = build_headers(provider, api_key)?;
     reqwest::Client::builder()
         .default_headers(headers)
+        .redirect(same_origin_redirect_policy())
         .build()
         .map_err(|e| report_reqwest_error("Failed to build HTTP client", &e))
+}
+
+/// Follow redirects only within the configured endpoint's origin.
+///
+/// reqwest drops `Authorization` when a redirect changes host, but not
+/// `x-api-key` (Anthropic format), and a 307/308 also re-sends the prompt. A
+/// redirect to another origin is therefore refused instead of followed.
+fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let same_origin = attempt
+            .previous()
+            .first()
+            .is_some_and(|initial| initial.origin() == attempt.url().origin());
+
+        if !same_origin {
+            attempt.error("refused to follow a redirect to a different origin")
+        } else if attempt.previous().len() > MAX_REDIRECTS {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
+/// Read a response body, failing once it exceeds `max_bytes`.
+async fn read_bounded_response(
+    response: reqwest::Response,
+    context: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let too_large = || format!("{context} is larger than {max_bytes} bytes");
+
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(too_large());
+    }
+
+    let mut body = Vec::new();
+    let mut chunks = response.bytes_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|e| report_reqwest_error(context, &e))?;
+        if body.len() + chunk.len() > max_bytes {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn parse_json_response<T: serde::de::DeserializeOwned>(
+    body: &[u8],
+    context: &str,
+) -> Result<T, String> {
+    serde_json::from_slice(body).map_err(|e| {
+        // serde_json's error text can quote values from the response, which may
+        // contain transcription content, so keep only its category and position.
+        let details = format!(
+            "{context} (kind: decode, {:?} error at line {} column {})",
+            e.classify(),
+            e.line(),
+            e.column()
+        );
+        error!("{details}");
+        details
+    })
+}
+
+/// Read the start of an error response for the returned error message.
+/// Whitespace runs are collapsed and other control characters escaped, so the
+/// snippet stays on one line and cannot inject terminal escapes into logs.
+async fn read_error_snippet(response: reqwest::Response) -> String {
+    let mut body = Vec::new();
+    let mut truncated = false;
+    let mut chunks = response.bytes_stream();
+    while let Some(Ok(chunk)) = chunks.next().await {
+        body.extend_from_slice(&chunk);
+        if body.len() > ERROR_BODY_SNIPPET_BYTES {
+            body.truncate(ERROR_BODY_SNIPPET_BYTES);
+            truncated = true;
+            break;
+        }
+    }
+
+    let text = String::from_utf8_lossy(&body);
+    let mut snippet = String::new();
+    for word in text.split_whitespace() {
+        if !snippet.is_empty() {
+            snippet.push(' ');
+        }
+        for c in word.chars() {
+            if c.is_control() {
+                snippet.extend(c.escape_default());
+            } else {
+                snippet.push(c);
+            }
+        }
+    }
+    if truncated && !snippet.is_empty() {
+        snippet.push_str("...");
+    }
+    snippet
 }
 
 /// Format a bounded error source chain.
@@ -454,12 +568,9 @@ pub async fn send_chat_completion_with_schema(
         && matches!(status.as_u16(), 400 | 422)
         && !request_body.reasoning.is_empty()
     {
-        let error_text = response.text().await.unwrap_or_else(|e| {
-            report_reqwest_error("Failed to read reasoning rejection response", &e)
-        });
         info!(
-            "Endpoint rejected request with reasoning disabled (status {}): {}. Retrying without reasoning fields",
-            status, error_text
+            "Endpoint rejected request with reasoning disabled (status {}). Retrying without reasoning fields",
+            status
         );
 
         request_body.reasoning = ReasoningParams::default();
@@ -487,20 +598,16 @@ pub async fn send_chat_completion_with_schema(
     }
 
     if !status.is_success() {
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|e| report_reqwest_error("Failed to read API error response", &e));
+        let error_text = read_error_snippet(response).await;
         return Err(format!(
             "API request failed with status {}: {}",
             status, error_text
         ));
     }
 
-    let completion: ChatCompletionResponse = response
-        .json()
-        .await
-        .map_err(|e| report_reqwest_error("Failed to parse API response", &e))?;
+    let body = read_bounded_response(response, "API response", MAX_RESPONSE_BYTES).await?;
+    let completion: ChatCompletionResponse =
+        parse_json_response(&body, "Failed to parse API response")?;
 
     let Some(choice) = completion.choices.into_iter().next() else {
         return Ok(None);
@@ -558,20 +665,16 @@ async fn send_anthropic_message(
     );
 
     if !status.is_success() {
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|e| report_reqwest_error("Failed to read API error response", &e));
+        let error_text = read_error_snippet(response).await;
         return Err(format!(
             "API request failed with status {}: {}",
             status, error_text
         ));
     }
 
-    let message: AnthropicMessagesResponse = response
-        .json()
-        .await
-        .map_err(|e| report_reqwest_error("Failed to parse API response", &e))?;
+    let body = read_bounded_response(response, "API response", MAX_RESPONSE_BYTES).await?;
+    let message: AnthropicMessagesResponse =
+        parse_json_response(&body, "Failed to parse API response")?;
 
     // A response cut off at the token budget is incomplete; pasting it would
     // silently drop the end of the dictation.
@@ -612,20 +715,16 @@ pub async fn fetch_models(
         sanitized_url(response.url())
     );
     if !status.is_success() {
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|e| report_reqwest_error("Failed to read model list error", &e));
+        let error_text = read_error_snippet(response).await;
         return Err(format!(
             "Model list request failed ({}): {}",
             status, error_text
         ));
     }
 
-    let parsed: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| report_reqwest_error("Failed to parse model list response", &e))?;
+    let body = read_bounded_response(response, "Model list response", MAX_MODEL_LIST_BYTES).await?;
+    let parsed: serde_json::Value =
+        parse_json_response(&body, "Failed to parse model list response")?;
 
     let mut models = Vec::new();
 
@@ -727,6 +826,55 @@ mod tests {
 
         format!("http://{address}")
     }
+
+    /// Serve the given raw HTTP responses, one per connection, and report the
+    /// request head (request line and headers) of every connection received.
+    fn serve_raw_responses(
+        listener: tokio::net::TcpListener,
+        responses: Vec<String>,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+        let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            for response in responses {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                let _ = requests_tx.send(String::from_utf8_lossy(&request).into_owned());
+                // The client may hang up early, for example on an oversized body.
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        requests_rx
+    }
+
+    async fn local_listener() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        (listener, base_url)
+    }
+
+    fn redirect_to(location: &str) -> String {
+        format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    fn ok_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    const ANTHROPIC_OK_BODY: &str = r#"{"content":[{"type":"text","text":"Cleaned text"}]}"#;
 
     #[test]
     fn error_source_chain_includes_all_nested_causes() {
@@ -962,5 +1110,133 @@ mod tests {
         )
         .await;
         assert!(result.unwrap_err().contains("truncated"));
+    }
+
+    #[tokio::test]
+    async fn cross_origin_redirect_is_not_followed_with_the_api_key() {
+        let (other_listener, other_url) = local_listener().await;
+        let mut other_requests =
+            serve_raw_responses(other_listener, vec![ok_response(ANTHROPIC_OK_BODY)]);
+        let (listener, base_url) = local_listener().await;
+        let mut requests = serve_raw_responses(
+            listener,
+            vec![redirect_to(&format!("{other_url}/messages"))],
+        );
+
+        let result = send_chat_completion(
+            &anthropic_format_provider(&base_url),
+            "SECRET_API_KEY".to_string(),
+            "claude-haiku",
+            "private prompt".to_string(),
+            false,
+        )
+        .await;
+
+        let forwarded = other_requests.try_recv().ok();
+        assert!(forwarded.is_none(), "redirect was followed: {forwarded:?}");
+        assert!(result.unwrap_err().contains("kind: redirect"));
+        assert!(requests.recv().await.unwrap().contains("SECRET_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn same_origin_redirect_is_followed() {
+        let (listener, base_url) = local_listener().await;
+        let mut requests = serve_raw_responses(
+            listener,
+            vec![
+                redirect_to(&format!("{base_url}/v1/messages")),
+                ok_response(ANTHROPIC_OK_BODY),
+            ],
+        );
+
+        let result = send_chat_completion(
+            &anthropic_format_provider(&base_url),
+            "key".to_string(),
+            "claude-haiku",
+            "raw text".to_string(),
+            false,
+        )
+        .await;
+
+        assert_eq!(result, Ok(Some("Cleaned text".to_string())));
+        assert!(requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("POST /messages "));
+        assert!(requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("POST /v1/messages "));
+    }
+
+    #[tokio::test]
+    async fn oversized_responses_are_rejected() {
+        let oversized = format!(
+            r#"{{"content":[{{"type":"text","text":"{}"}}]}}"#,
+            "x".repeat(MAX_RESPONSE_BYTES)
+        );
+        // One response declares its length up front, the other is only
+        // delimited by the connection closing.
+        let unannounced = format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{oversized}");
+
+        for response in [ok_response(&oversized), unannounced] {
+            let (listener, base_url) = local_listener().await;
+            let _requests = serve_raw_responses(listener, vec![response]);
+
+            let error = send_chat_completion(
+                &anthropic_format_provider(&base_url),
+                "key".to_string(),
+                "claude-haiku",
+                "raw text".to_string(),
+                false,
+            )
+            .await
+            .unwrap_err();
+
+            assert!(error.contains("is larger than"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn api_error_keeps_a_short_single_line_snippet_of_the_body() {
+        let body = format!(
+            "{}{}",
+            "{\n  \"error\": \"model not found\x1b[31m\"\n}",
+            "PRIVATE ".repeat(1000)
+        );
+        let base_url = serve_one_response("404 Not Found", &body).await;
+
+        let error = send_chat_completion(
+            &provider("custom", &base_url),
+            "key".to_string(),
+            "test-model",
+            "raw text".to_string(),
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.starts_with("API request failed with status 404 Not Found: "));
+        assert!(
+            error.contains(r#"{ "error": "model not found\u{1b}[31m" }"#),
+            "{error}"
+        );
+        assert!(!error.chars().any(char::is_control), "{error}");
+        assert!(error.ends_with("..."));
+        assert!(error.len() < ERROR_BODY_SNIPPET_BYTES + 100);
+    }
+
+    #[test]
+    fn json_parse_errors_do_not_echo_response_values() {
+        let error = parse_json_response::<ChatCompletionResponse>(
+            br#"{"choices":"PRIVATE TRANSCRIPTION CONTENT"}"#,
+            "Failed to parse API response",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("kind: decode"));
+        assert!(!error.contains("PRIVATE TRANSCRIPTION CONTENT"));
     }
 }
